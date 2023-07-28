@@ -1,7 +1,7 @@
 #### **About DYC**
 
-- 👋🏼 Hello，World！我是DYC，一位喜欢思考、记录的程序员。
-<!-- - 👨🏻‍🎓 我目前就读于[海南大学 (Hainanu)](https://ha.hainanu.edu.cn/home2020/)，大四，计算机类专业。 -->
+- 👋🏼 Hello，World！我是DYC
+ - 👨🏻‍🎓 我目前就读于USTC,计算机类专业。
 
 
 #### **🚀 爱好和兴趣**
