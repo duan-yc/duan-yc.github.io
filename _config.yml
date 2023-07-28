@@ -4,7 +4,7 @@ SEOTitle: DYC的博客 | DYC Blog
 header-img: img/home-bg.jpg
 email: dy653134@gmail.com
 description: "关于计算机科学、程序与设计、想法与思考 | DYC，Computer Science & Digital Technology Lover，Student | 这里是 @dyc 的个人博客，与你一起发现更大的世界。"
-keyword: "DYC, dyc, 博客, 个人网站, 互联网, Web, JavaScript, 前端, 计算机科学，网络空间安全，Linux，科技，数码"
+keyword: "DYC, 博客, 个人网站, 互联网, Web, JavaScript, 前端, 计算机科学，网络空间安全，Linux，科技，数码"
 url: "https://duan-yc.github.io"              # your host, for absolute URL
 baseurl: ""                             # for example, '/blog' if your blog hosted on 'host/blog'
 
