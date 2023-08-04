@@ -1,11 +1,11 @@
 
-![image-20220611131628941](https://cdn.jsdelivr.net/gh/peng-yq/Gallery/img/202206111316495.png)
 
-本博客将主要用于记录在学习过程中的笔记和感想，此外还包括对数码产品的评测以及人文思考
+
+本博客将主要用于记录在学习过程中的笔记和感想
 
 
 ### 致谢
-
+- 感谢好友[pyq](https://github.com/peng-yq)的模版和教程
 - 感谢[Hux](http://huangxuan.me/)大佬的[模板](https://github.com/Huxpro/huxpro.github.io)和教程
 - 搭建博客的过程中参考了[flyingwzb](https://github.com/flyingwzb/flyingwzb.github.io)的一些教程
 
