@@ -9,8 +9,6 @@ catalog: true
 tags:
   - semantic segmentation
 
-
-
 ---
 
 Mask2former
