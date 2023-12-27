@@ -1,7 +1,6 @@
 #### **About DYC**
 
 - 👋🏼 Hello，World！我是DYC
- - 👨🏻‍🎓 我目前就读于USTC,计算机专业。
  - 💌 我的邮箱是 dy653134@gmail.com
 
 
