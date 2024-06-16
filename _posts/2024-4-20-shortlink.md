@@ -209,3 +209,423 @@ public void removeRecycleBin(RecycleBinRemoveReqDTO requestParam) {
 }
 ```
 
+#### 短链接监控
+
+###### pv统计
+
+这里需要写sql语句，所以首先编写**LinkAccessStatsMapper**层
+
+```java
+public interface LinkAccessStatsMapper extends BaseMapper<LinkAccessStatsDO> {
+
+    /**
+     * 记录基础访问监控数据
+     */
+    @Insert("INSERT INTO t_link_access_stats (full_short_url, gid, date, pv, uv, uip, hour, weekday, create_time, update_time, del_flag) " +
+            "VALUES( #{linkAccessStats.fullShortUrl}, #{linkAccessStats.gid}, #{linkAccessStats.date}, #{linkAccessStats.pv}, #{linkAccessStats.uv}, #{linkAccessStats.uip}, #{linkAccessStats.hour}, #{linkAccessStats.weekday}, NOW(), NOW(), 0) ON DUPLICATE KEY UPDATE pv = pv +  #{linkAccessStats.pv}, " +
+            "uv = uv + #{linkAccessStats.uv}, " +
+            " uip = uip + #{linkAccessStats.uip};")
+    void shortLinkStats(@Param("linkAccessStats") LinkAccessStatsDO linkAccessStatsDO);
+}
+```
+
+接着在service中编写插入函数，由于插入的地方可能没有gid，所以要进行判断，如果没有的话就需要首先去查库获取，接着就可以利用builder创建对象然后调用mapper
+
+```java
+    private void shortLinkStats(String fullShortUrl, String gid, ServletRequest request, ServletResponse response) {
+        try {
+            if (StrUtil.isBlank(gid)) {
+                LambdaQueryWrapper<ShortLinkGotoDO> queryWrapper = Wrappers.lambdaQuery(ShortLinkGotoDO.class)
+                        .eq(ShortLinkGotoDO::getFullShortUrl, fullShortUrl);
+                ShortLinkGotoDO shortLinkGotoDO = shortLinkGotoMapper.selectOne(queryWrapper);
+                gid = shortLinkGotoDO.getGid();
+            }
+            int hour = DateUtil.hour(new Date(), true);
+            Week week = DateUtil.dayOfWeekEnum(new Date());
+            int weekValue = week.getIso8601Value();
+            LinkAccessStatsDO linkAccessStatsDO = LinkAccessStatsDO.builder()
+                    .pv(1)
+                    .uv(1)
+                    .uip(1)
+                    .hour(hour)
+                    .weekday(weekValue)
+                    .fullShortUrl(fullShortUrl)
+                    .gid(gid)
+                    .date(new Date())
+                    .build();
+            linkAccessStatsMapper.shortLinkStats(linkAccessStatsDO);
+        } catch (Throwable ex) {
+            log.error("短链接访问量统计异常", ex);
+        }
+    }
+```
+
+###### uv统计
+
+统计用户的数量，一个用户可能多次访问，但是只算一次，所以这里需要对每个用户设置一个唯一表示，然后放到cookie中，每次访问的时候查cookie，看是否存在该cookie，并且从该cookie取出的值是否在redis中
+
+```java
+private void shortLinkStats(String fullShortUrl, String gid, ServletRequest request, ServletResponse response) {
+        AtomicBoolean uvFirstFlag = new AtomicBoolean();
+        Cookie[] cookies = ((HttpServletRequest) request).getCookies();
+        try {
+          	//这里定义一个runnable任务，用于如果没有cookie就添加cookie
+            Runnable addResponseCookieTask = () -> {
+                String uv = UUID.fastUUID().toString();
+                Cookie uvCookie = new Cookie("uv", uv);
+                uvCookie.setMaxAge(60 * 60 * 24 * 30);
+              	//设置一个子路径的cookie，不然所有cookie都会堆到一个路径中
+                uvCookie.setPath(StrUtil.sub(fullShortUrl, fullShortUrl.indexOf("/"), fullShortUrl.length()));
+                ((HttpServletResponse) response).addCookie(uvCookie);
+                uvFirstFlag.set(Boolean.TRUE);
+                stringRedisTemplate.opsForSet().add("short-link:stats:uv:" + fullShortUrl, uv);
+            };
+            if (ArrayUtil.isNotEmpty(cookies)) {
+              	//取出cookie判断是否是自己这个
+                Arrays.stream(cookies)
+                        .filter(each -> Objects.equals(each.getName(), "uv"))
+                        .findFirst()
+                        .map(Cookie::getValue)
+                        .ifPresentOrElse(each -> {
+                          	//利用redis的set结构 看是否能插入 来判断redis中是否有该cookie
+                            Long added = stringRedisTemplate.opsForSet().add("short-link:stats:uv:" + fullShortUrl, each);
+                            uvFirstFlag.set(added != null && added > 0L);
+                        }, addResponseCookieTask);
+            } else {
+                addResponseCookieTask.run();
+            }
+            if (StrUtil.isBlank(gid)) {
+                LambdaQueryWrapper<ShortLinkGotoDO> queryWrapper = Wrappers.lambdaQuery(ShortLinkGotoDO.class)
+                        .eq(ShortLinkGotoDO::getFullShortUrl, fullShortUrl);
+@@ -264,7 +293,7 @@ public class ShortLinkServiceImpl extends ServiceImpl<ShortLinkMapper, ShortLink
+            int weekValue = week.getIso8601Value();
+            LinkAccessStatsDO linkAccessStatsDO = LinkAccessStatsDO.builder()
+                    .pv(1)
+              			//根据flag来判断是否有该cookie
+                    .uv(uvFirstFlag.get() ? 1 : 0)
+                    .uip(1)
+                    .hour(hour)
+                    .weekday(weekValue)
+              			.fullShortUrl(fullShortUrl)
+                    .gid(gid)
+                    .date(new Date())
+                    .build();
+            linkAccessStatsMapper.shortLinkStats(linkAccessStatsDO);
+        } catch (Throwable ex) {
+            log.error("短链接访问量统计异常", ex);
+        }
+    }
+```
+
+###### uip统计
+
+这里需要获取每个请求的真实ip，然后拿去redis中比较即可
+
+获取ip函数如下，可以在util类中创建
+
+```java
+    public static String getActualIp(HttpServletRequest request) {
+        String ipAddress = request.getHeader("X-Forwarded-For");
+        if (ipAddress == null || ipAddress.isEmpty() || "unknown".equalsIgnoreCase(ipAddress)) {
+            ipAddress = request.getHeader("Proxy-Client-IP");
+        }
+        if (ipAddress == null || ipAddress.isEmpty() || "unknown".equalsIgnoreCase(ipAddress)) {
+            ipAddress = request.getHeader("WL-Proxy-Client-IP");
+        }
+        if (ipAddress == null || ipAddress.isEmpty() || "unknown".equalsIgnoreCase(ipAddress)) {
+            ipAddress = request.getHeader("HTTP_CLIENT_IP");
+        }
+        if (ipAddress == null || ipAddress.isEmpty() || "unknown".equalsIgnoreCase(ipAddress)) {
+            ipAddress = request.getHeader("HTTP_X_FORWARDED_FOR");
+        }
+        if (ipAddress == null || ipAddress.isEmpty() || "unknown".equalsIgnoreCase(ipAddress)) {
+            ipAddress = request.getRemoteAddr();
+        }
+        return ipAddress;
+    }
+```
+
+接着就可以shortLinkStats函数中对redis进行判断，然后看是否需要修改ip
+
+###### 地区统计
+
+**获取地区 API**
+
+[IP-API.com - Geolocation API](https://ip-api.com/)
+
+- 支持国内外IP地址
+- 但是使用API限制较多
+
+[IP定位-API文档-开发指南-Web服务 API | 高德地图API](https://lbs.amap.com/api/webservice/guide/api/ipconfig)
+
+- 仅支持国内IP地址
+- 使用API限制宽松
+
+由于地区统计需要的参数比较多，所以先建了一个实体，并且建立对应的mapper层
+
+```java
+public interface LinkLocaleStatsMapper extends BaseMapper<LinkLocaleStatsDO> {
+
+    /**
+     * 记录地区访问监控数据
+     */
+    @Insert("INSERT INTO t_link_locale_stats (full_short_url, gid, date, cnt, country, province, city, adcode, create_time, update_time, del_flag) " +
+            "VALUES( #{linkLocaleStats.fullShortUrl}, #{linkLocaleStats.gid}, #{linkLocaleStats.date}, #{linkLocaleStats.cnt}, #{linkLocaleStats.country}, #{linkLocaleStats.province}, #{linkLocaleStats.city}, #{linkLocaleStats.adcode}, NOW(), NOW(), 0) " +
+            "ON DUPLICATE KEY UPDATE cnt = cnt +  #{linkLocaleStats.cnt};")
+    void shortLinkLocaleState(@Param("linkLocaleStats") LinkLocaleStatsDO linkLocaleStatsDO);
+}
+```
+
+接着在service层的shortLinkStats方法中设置
+
+```java
+Map<String, Object> localeParamMap = new HashMap<>();
+						//statsLocaleAmapKey是网站获取，在配置文件中写，然后在该类用@value导入进来
+            localeParamMap.put("key", statsLocaleAmapKey);
+            localeParamMap.put("ip", remoteAddr);
+						//AMAP_REMOTE_URL是定义在常量类中的url，也是api网站中获取
+            String localeResultStr = HttpUtil.get(AMAP_REMOTE_URL, localeParamMap);
+            JSONObject localeResultObj = JSON.parseObject(localeResultStr);
+            String infoCode = localeResultObj.getString("infocode");
+            if (StrUtil.isNotBlank(infoCode) && StrUtil.equals(infoCode, "10000")) {
+                String province = localeResultObj.getString("province");
+                boolean unknownFlag = StrUtil.equals(province, "[]");
+                LinkLocaleStatsDO linkLocaleStatsDO = LinkLocaleStatsDO.builder()
+                        .province(unknownFlag ? "未知" : province)
+                        .city(unknownFlag ? "未知" : localeResultObj.getString("city"))
+                        .adcode(unknownFlag ? "未知" : localeResultObj.getString("adcode"))
+                        .cnt(1)
+                        .fullShortUrl(fullShortUrl)
+                        .country("中国")
+                        .gid(gid)
+                        .date(new Date())
+                        .build();
+                linkLocaleStatsMapper.shortLinkLocaleState(linkLocaleStatsDO);
+            }
+```
+
+###### 操作系统统计
+
+也是需要单独建表，接着定义mapper层
+
+```java
+public interface LinkOsStatsMapper extends BaseMapper<LinkOsStatsDO> {
+
+    /**
+     * 记录地区访问监控数据
+     */
+    @Insert("INSERT INTO t_link_os_stats (full_short_url, gid, date, cnt, os, create_time, update_time, del_flag) " +
+            "VALUES( #{linkOsStats.fullShortUrl}, #{linkOsStats.gid}, #{linkOsStats.date}, #{linkOsStats.cnt}, #{linkOsStats.os}, NOW(), NOW(), 0) " +
+            "ON DUPLICATE KEY UPDATE cnt = cnt +  #{linkOsStats.cnt};")
+    void shortLinkOsState(@Param("linkOsStats") LinkOsStatsDO linkOsStatsDO);
+}
+```
+
+接着和前面一个套路，在shortLinkStats方法中获取相关的参数，然后利用builder来构造出该对象，接着用mapper的方法插入即可
+
+这是通过useragent获取os的方法，定义在util类中
+
+```java
+    public static String getOs(HttpServletRequest request) {
+        String userAgent = request.getHeader("User-Agent");
+        if (userAgent.toLowerCase().contains("windows")) {
+            return "Windows";
+        } else if (userAgent.toLowerCase().contains("mac")) {
+            return "Mac OS";
+        } else if (userAgent.toLowerCase().contains("linux")) {
+            return "Linux";
+        } else if (userAgent.toLowerCase().contains("android")) {
+            return "Android";
+        } else if (userAgent.toLowerCase().contains("iphone") || userAgent.toLowerCase().contains("ipad")) {
+            return "iOS";
+        } else {
+            return "Unknown";
+        }
+    }
+```
+
+###### 短链接监控
+
+前面是将各种参数记录在数据库中，现在就是要从数据库中拿出这些数据进行展示
+
+```java
+public ShortLinkStatsRespDTO oneShortLinkStats(ShortLinkStatsReqDTO requestParam) {
+    checkGroupBelongToUser(requestParam.getGid());
+    List<LinkAccessStatsDO> listStatsByShortLink = linkAccessStatsMapper.listStatsByShortLink(requestParam);
+    if (CollUtil.isEmpty(listStatsByShortLink)) {
+        return null;
+    }
+    // 基础访问数据
+    LinkAccessStatsDO pvUvUidStatsByShortLink = linkAccessLogsMapper.findPvUvUidStatsByShortLink(requestParam);
+    // 基础访问详情
+    List<ShortLinkStatsAccessDailyRespDTO> daily = new ArrayList<>();
+    List<String> rangeDates = DateUtil.rangeToList(DateUtil.parse(requestParam.getStartDate()), DateUtil.parse(requestParam.getEndDate()), DateField.DAY_OF_MONTH).stream()
+            .map(DateUtil::formatDate)
+            .toList();
+    rangeDates.forEach(each -> listStatsByShortLink.stream()
+            .filter(item -> Objects.equals(each, DateUtil.formatDate(item.getDate())))
+            .findFirst()
+            .ifPresentOrElse(item -> {
+                ShortLinkStatsAccessDailyRespDTO accessDailyRespDTO = ShortLinkStatsAccessDailyRespDTO.builder()
+                        .date(each)
+                        .pv(item.getPv())
+                        .uv(item.getUv())
+                        .uip(item.getUip())
+                        .build();
+                daily.add(accessDailyRespDTO);
+            }, () -> {
+                ShortLinkStatsAccessDailyRespDTO accessDailyRespDTO = ShortLinkStatsAccessDailyRespDTO.builder()
+                        .date(each)
+                        .pv(0)
+                        .uv(0)
+                        .uip(0)
+                        .build();
+                daily.add(accessDailyRespDTO);
+            }));
+    // 地区访问详情（仅国内）
+    List<ShortLinkStatsLocaleCNRespDTO> localeCnStats = new ArrayList<>();
+    List<LinkLocaleStatsDO> listedLocaleByShortLink = linkLocaleStatsMapper.listLocaleByShortLink(requestParam);
+    int localeCnSum = listedLocaleByShortLink.stream()
+            .mapToInt(LinkLocaleStatsDO::getCnt)
+            .sum();
+    listedLocaleByShortLink.forEach(each -> {
+        double ratio = (double) each.getCnt() / localeCnSum;
+        double actualRatio = Math.round(ratio * 100.0) / 100.0;
+        ShortLinkStatsLocaleCNRespDTO localeCNRespDTO = ShortLinkStatsLocaleCNRespDTO.builder()
+                .cnt(each.getCnt())
+                .locale(each.getProvince())
+                .ratio(actualRatio)
+                .build();
+        localeCnStats.add(localeCNRespDTO);
+    });
+    // 小时访问详情
+    List<Integer> hourStats = new ArrayList<>();
+    List<LinkAccessStatsDO> listHourStatsByShortLink = linkAccessStatsMapper.listHourStatsByShortLink(requestParam);
+    for (int i = 0; i < 24; i++) {
+        AtomicInteger hour = new AtomicInteger(i);
+        int hourCnt = listHourStatsByShortLink.stream()
+                .filter(each -> Objects.equals(each.getHour(), hour.get()))
+                .findFirst()
+                .map(LinkAccessStatsDO::getPv)
+                .orElse(0);
+        hourStats.add(hourCnt);
+    }
+    // 高频访问IP详情
+    List<ShortLinkStatsTopIpRespDTO> topIpStats = new ArrayList<>();
+    List<HashMap<String, Object>> listTopIpByShortLink = linkAccessLogsMapper.listTopIpByShortLink(requestParam);
+    listTopIpByShortLink.forEach(each -> {
+        ShortLinkStatsTopIpRespDTO statsTopIpRespDTO = ShortLinkStatsTopIpRespDTO.builder()
+                .ip(each.get("ip").toString())
+                .cnt(Integer.parseInt(each.get("count").toString()))
+                .build();
+        topIpStats.add(statsTopIpRespDTO);
+    });
+    // 一周访问详情
+    List<Integer> weekdayStats = new ArrayList<>();
+    List<LinkAccessStatsDO> listWeekdayStatsByShortLink = linkAccessStatsMapper.listWeekdayStatsByShortLink(requestParam);
+    for (int i = 1; i < 8; i++) {
+        AtomicInteger weekday = new AtomicInteger(i);
+        int weekdayCnt = listWeekdayStatsByShortLink.stream()
+                .filter(each -> Objects.equals(each.getWeekday(), weekday.get()))
+                .findFirst()
+                .map(LinkAccessStatsDO::getPv)
+                .orElse(0);
+        weekdayStats.add(weekdayCnt);
+    }
+    // 浏览器访问详情
+    List<ShortLinkStatsBrowserRespDTO> browserStats = new ArrayList<>();
+    List<HashMap<String, Object>> listBrowserStatsByShortLink = linkBrowserStatsMapper.listBrowserStatsByShortLink(requestParam);
+    int browserSum = listBrowserStatsByShortLink.stream()
+            .mapToInt(each -> Integer.parseInt(each.get("count").toString()))
+            .sum();
+    listBrowserStatsByShortLink.forEach(each -> {
+        double ratio = (double) Integer.parseInt(each.get("count").toString()) / browserSum;
+        double actualRatio = Math.round(ratio * 100.0) / 100.0;
+        ShortLinkStatsBrowserRespDTO browserRespDTO = ShortLinkStatsBrowserRespDTO.builder()
+                .cnt(Integer.parseInt(each.get("count").toString()))
+                .browser(each.get("browser").toString())
+                .ratio(actualRatio)
+                .build();
+        browserStats.add(browserRespDTO);
+    });
+    // 访客访问类型详情
+    List<ShortLinkStatsUvRespDTO> uvTypeStats = new ArrayList<>();
+    HashMap<String, Object> findUvTypeByShortLink = linkAccessLogsMapper.findUvTypeCntByShortLink(requestParam);
+    int oldUserCnt = Integer.parseInt(
+            Optional.ofNullable(findUvTypeByShortLink)
+                    .map(each -> each.get("oldUserCnt"))
+                    .map(Object::toString)
+                    .orElse("0")
+    );
+    int newUserCnt = Integer.parseInt(
+            Optional.ofNullable(findUvTypeByShortLink)
+                    .map(each -> each.get("newUserCnt"))
+                    .map(Object::toString)
+                    .orElse("0")
+    );
+    int uvSum = oldUserCnt + newUserCnt;
+    double oldRatio = (double) oldUserCnt / uvSum;
+    double actualOldRatio = Math.round(oldRatio * 100.0) / 100.0;
+    double newRatio = (double) newUserCnt / uvSum;
+    double actualNewRatio = Math.round(newRatio * 100.0) / 100.0;
+    ShortLinkStatsUvRespDTO newUvRespDTO = ShortLinkStatsUvRespDTO.builder()
+            .uvType("newUser")
+            .cnt(newUserCnt)
+            .ratio(actualNewRatio)
+            .build();
+    uvTypeStats.add(newUvRespDTO);
+    ShortLinkStatsUvRespDTO oldUvRespDTO = ShortLinkStatsUvRespDTO.builder()
+            .uvType("oldUser")
+            .cnt(oldUserCnt)
+            .ratio(actualOldRatio)
+            .build();
+    uvTypeStats.add(oldUvRespDTO);
+    // 访问设备类型详情
+    List<ShortLinkStatsDeviceRespDTO> deviceStats = new ArrayList<>();
+    List<LinkDeviceStatsDO> listDeviceStatsByShortLink = linkDeviceStatsMapper.listDeviceStatsByShortLink(requestParam);
+    int deviceSum = listDeviceStatsByShortLink.stream()
+            .mapToInt(LinkDeviceStatsDO::getCnt)
+            .sum();
+    listDeviceStatsByShortLink.forEach(each -> {
+        double ratio = (double) each.getCnt() / deviceSum;
+        double actualRatio = Math.round(ratio * 100.0) / 100.0;
+        ShortLinkStatsDeviceRespDTO deviceRespDTO = ShortLinkStatsDeviceRespDTO.builder()
+                .cnt(each.getCnt())
+                .device(each.getDevice())
+                .ratio(actualRatio)
+                .build();
+        deviceStats.add(deviceRespDTO);
+    });
+    // 访问网络类型详情
+    List<ShortLinkStatsNetworkRespDTO> networkStats = new ArrayList<>();
+    List<LinkNetworkStatsDO> listNetworkStatsByShortLink = linkNetworkStatsMapper.listNetworkStatsByShortLink(requestParam);
+    int networkSum = listNetworkStatsByShortLink.stream()
+            .mapToInt(LinkNetworkStatsDO::getCnt)
+            .sum();
+    listNetworkStatsByShortLink.forEach(each -> {
+        double ratio = (double) each.getCnt() / networkSum;
+        double actualRatio = Math.round(ratio * 100.0) / 100.0;
+        ShortLinkStatsNetworkRespDTO networkRespDTO = ShortLinkStatsNetworkRespDTO.builder()
+                .cnt(each.getCnt())
+                .network(each.getNetwork())
+                .ratio(actualRatio)
+                .build();
+        networkStats.add(networkRespDTO);
+    });
+    return ShortLinkStatsRespDTO.builder()
+            .pv(pvUvUidStatsByShortLink.getPv())
+            .uv(pvUvUidStatsByShortLink.getUv())
+            .uip(pvUvUidStatsByShortLink.getUip())
+            .daily(daily)
+            .localeCnStats(localeCnStats)
+            .hourStats(hourStats)
+            .topIpStats(topIpStats)
+            .weekdayStats(weekdayStats)
+            .browserStats(browserStats)
+            .osStats(osStats)
+            .uvTypeStats(uvTypeStats)
+            .deviceStats(deviceStats)
+            .networkStats(networkStats)
+            .build();
+}
+```
