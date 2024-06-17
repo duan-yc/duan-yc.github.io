@@ -629,3 +629,78 @@ public ShortLinkStatsRespDTO oneShortLinkStats(ShortLinkStatsReqDTO requestParam
             .build();
 }
 ```
+
+###### 分页访问记录
+
+这里比较麻烦的是写sql语句
+
+首先写service层代码
+
+```java
+public IPage<ShortLinkStatsAccessRecordRespDTO> shortLinkStatsAccessRecord(ShortLinkStatsAccessRecordReqDTO requestParam) {
+        LambdaQueryWrapper<LinkAccessLogsDO> queryWrapper = Wrappers.lambdaQuery(LinkAccessLogsDO.class)
+                .eq(LinkAccessLogsDO::getGid, requestParam.getGid())
+                .eq(LinkAccessLogsDO::getFullShortUrl, requestParam.getFullShortUrl())
+            	//这里要用between
+                .between(LinkAccessLogsDO::getCreateTime, requestParam.getStartDate(), requestParam.getEndDate())
+                .eq(LinkAccessLogsDO::getDelFlag, 0)
+                .orderByDesc(LinkAccessLogsDO::getCreateTime);
+        IPage<LinkAccessLogsDO> linkAccessLogsDOIPage = linkAccessLogsMapper.selectPage(requestParam, queryWrapper);
+        IPage<ShortLinkStatsAccessRecordRespDTO> actualResult = linkAccessLogsDOIPage.convert(each -> BeanUtil.toBean(each, ShortLinkStatsAccessRecordRespDTO.class));
+        List<String> userAccessLogsList = actualResult.getRecords().stream()
+                .map(ShortLinkStatsAccessRecordRespDTO::getUser)
+                .toList();
+        List<Map<String, Object>> uvTypeList = linkAccessLogsMapper.selectUvTypeByUsers(
+                requestParam.getGid(),
+                requestParam.getFullShortUrl(),
+                requestParam.getStartDate(),
+                requestParam.getEndDate(),
+                userAccessLogsList
+        );
+        actualResult.getRecords().forEach(each -> {
+            String uvType = uvTypeList.stream()
+                    .filter(item -> Objects.equals(each.getUser(), item.get("user")))
+                    .findFirst()
+                    .map(item -> item.get("UvType"))
+                    .map(Object::toString)
+                    .orElse("旧访客");
+            each.setUvType(uvType);
+        });
+        return actualResult;
+    }
+```
+
+接着调用mapper层手写的sql语句
+
+这里要注意，由于使用了动态语句，所以要加script，分页才能正确解析
+
+```java
+    @Select("<script> " +
+            "SELECT " +
+            "    user, " +
+            "    CASE " +
+            "        WHEN MIN(create_time) BETWEEN #{startDate} AND #{endDate} THEN '新访客' " +
+            "        ELSE '老访客' " +
+            "    END AS uvType " +
+            "FROM " +
+            "    t_link_access_logs " +
+            "WHERE " +
+            "    full_short_url = #{fullShortUrl} " +
+            "    AND gid = #{gid} " +
+            "    AND user IN " +
+            "    <foreach item='item' index='index' collection='userAccessLogsList' open='(' separator=',' close=')'> " +
+            "        #{item} " +
+            "    </foreach> " +
+            "GROUP BY " +
+            "    user;" +
+            "    </script>"
+    )
+    List<Map<String, Object>> selectUvTypeByUsers(
+            @Param("gid") String gid,
+            @Param("fullShortUrl") String fullShortUrl,
+            @Param("startDate") String startDate,
+            @Param("endDate") String endDate,
+            @Param("userAccessLogsList") List<String> userAccessLogsList
+    );
+```
+
