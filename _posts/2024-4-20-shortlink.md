@@ -26,6 +26,78 @@ tags:
 
 ###### 短链接信息修改
 
+1. 删除原始短链接记录
+
+   t_link表是按照gid进行分表的，所以如果修改短链接的gid，则需要先删除原gid分表中的记录，再在新gid分表中插入修改后的短链接记录
+
+2. 修改唯一索引
+
+   考虑到修改gid需要先删再新添加，有可能新增的短链接又路由到了原来的表，就会和原来的造成索引冲突，所以新加了一个delete_time，新增的del_time和full_short_url组成唯一索引可以有效避免这种冲突
+
+3. 迁移相关业务数据
+
+   将短链接相关的表进行数据修改，如果涉及到分片行为，先删除原有数据再新增。如果不涉及分片行为，只需要修改对应的数据库表记录即可
+
+4. 引入读写锁
+
+   思考一个问题，如果短链接正在修改分组，这时有用户正在访问短链接，统计监控相关的分组还是之前的数据，是否就涉及到无法正确统计监控数据问题？
+
+   所以这里就引入读写锁，进行统计监控的时候需要获取读锁，修改分组的时候需要获取写锁
+
+5. 引入延迟队列
+
+   考虑这个场景，如果用户正在修改短链接分组，因为涉及到表操作很多，我们假设可能会操作 300ms。
+
+   这 300ms 内难道就不允许用户访问？
+
+   所以引入延迟队列，在监控的时候，如果没办法获取读锁，就将相关数据加入延迟队列，延迟队列会在5s后再次进行更新
+
+   ```java
+   public class DelayShortLinkStatsConsumer implements InitializingBean {
+   
+       private final RedissonClient redissonClient;
+       private final ShortLinkService shortLinkService;
+   
+       public void onMessage() {
+           Executors.newSingleThreadExecutor(
+                           runnable -> {
+                               Thread thread = new Thread(runnable);
+                               thread.setName("delay_short-link_stats_consumer");
+                               thread.setDaemon(Boolean.TRUE);
+                               return thread;
+                           })
+                   .execute(() -> {
+                       RBlockingDeque<ShortLinkStatsRecordDTO> blockingDeque = redissonClient.getBlockingDeque(DELAY_QUEUE_STATS_KEY);
+                       RDelayedQueue<ShortLinkStatsRecordDTO> delayedQueue = redissonClient.getDelayedQueue(blockingDeque);
+                       for (; ; ) {
+                           try {
+                               ShortLinkStatsRecordDTO statsRecord = delayedQueue.poll();
+                               if (statsRecord != null) {
+                                   shortLinkService.shortLinkStats(null, null, statsRecord);
+                                   continue;
+                               }
+                               LockSupport.parkUntil(500);
+                           } catch (Throwable ignored) {
+                           }
+                       }
+                   });
+       }
+   
+       @Override
+       public void afterPropertiesSet() throws Exception {
+           onMessage();
+       }
+   }
+   ```
+
+6. 回收站删除
+
+7. 修改相关接口
+
+
+
+
+
 ###### 短链接跳转
 
 大致思路：根据短链接进行查表，因为是分表情况，所以要建立一个路由表，通过路由表找到长连接，然后进行跳转
@@ -703,4 +775,82 @@ public IPage<ShortLinkStatsAccessRecordRespDTO> shortLinkStatsAccessRecord(Short
             @Param("userAccessLogsList") List<String> userAccessLogsList
     );
 ```
+
+##### 功能扩展
+
+###### 添加白名单
+
+考虑到原始链接需要是合法的链接，如果是对链接进行判断是否合法就太麻烦了，所以就采用添加白名单的方式
+
+1. 在application配置文件中写入允许链接的域名
+
+2. 然后在创建短链接和修改短链接的时候就要对域名进行验证
+
+   ```java
+   public static String extractDomain(String url) {
+           String domain = null;
+           try {
+               URI uri = new URI(url);
+               String host = uri.getHost();
+               if (StrUtil.isNotBlank(host)) {
+                   domain = host;
+                   if (domain.startsWith("www.")) {
+                       domain = host.substring(4);
+                   }
+               }
+           } catch (Exception ignored) {
+           }
+           return domain;
+       }
+       
+   private void verificationWhitelist(String originUrl) {
+           Boolean enable = gotoDomainWhiteListConfiguration.getEnable();
+           if (enable == null || !enable) {
+               return;
+           }
+           String domain = LinkUtil.extractDomain(originUrl);
+           if (StrUtil.isBlank(domain)) {
+               throw new ClientException("跳转链接填写错误");
+           }
+           List<String> details = gotoDomainWhiteListConfiguration.getDetails();
+           if (!details.contains(domain)) {
+               throw new ClientException("演示环境为避免恶意攻击，请生成以下网站跳转链接：" + gotoDomainWhiteListConfiguration.getNames());
+           }
+       }
+   ```
+
+###### 创建分组限制
+
+默认创建最多20个分组，因为后面部署是微服务，创建分组的时候需要进行判断当前分组数量是否超过限制，但是syn是锁不了的，所以要使用分布式锁
+
+```java
+public void saveGroup(String username, String groupName) {
+        RLock lock = redissonClient.getLock(String.format(LOCK_GROUP_CREATE_KEY, username));
+        lock.lock();
+        try {
+            LambdaQueryWrapper<GroupDO> queryWrapper = Wrappers.lambdaQuery(GroupDO.class)
+                    .eq(GroupDO::getUsername, username)
+                    .eq(GroupDO::getDelFlag, 0);
+            List<GroupDO> groupDOList = baseMapper.selectList(queryWrapper);
+            if (CollUtil.isNotEmpty(groupDOList) && groupDOList.size() == groupMaxNum) {
+                throw new ClientException(String.format("已超出最大分组数：%d", groupMaxNum));
+            }
+            String gid;
+            do {
+                gid = RandomGenerator.generateRandom();
+            } while (!hasGid(username, gid));
+            GroupDO groupDO = GroupDO.builder()
+                    .gid(gid)
+                    .sortOrder(0)
+                    .username(username)
+                    .name(groupName)
+                    .build();
+            baseMapper.insert(groupDO);
+        } finally {
+            lock.unlock();
+        }
+    }
+```
+
+###### 流量风控
 
