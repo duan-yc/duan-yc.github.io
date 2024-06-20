@@ -776,6 +776,9 @@ public IPage<ShortLinkStatsAccessRecordRespDTO> shortLinkStatsAccessRecord(Short
     );
 ```
 
+<<<<<<< HEAD
+
+=======
 ##### 功能扩展
 
 ###### 添加白名单
@@ -853,4 +856,88 @@ public void saveGroup(String username, String groupName) {
 ```
 
 ###### 流量风控
+
+**短链接后管**
+
+根据登录用户做出控制，比如 x 秒请求后管系统的频率最多 x 次。
+
+实现原理也比较简单，**通过 Redis `increment` 命令对一个数据进行递增**，如果超过 x 次就会返回失败。这里有个细节就是这个周期是 x 秒，需要对 Redis 的 Key 设置 x 秒有效期。
+
+但是 Redis 中对于 `increment` 命令是没有提供过期命令的，这就需要两步操作，进而出现原子性问题
+
+为此，我们需要通过 LUA 脚本来保证原子性
+
+```lua
+-- 设置用户访问频率限制的参数
+local username = KEYS[1]
+local timeWindow = tonumber(ARGV[1]) -- 时间窗口，单位：秒
+
+-- 构造 Redis 中存储用户访问次数的键名
+local accessKey = "short-link:user-flow-risk-control:" .. username
+
+-- 原子递增访问次数，并获取递增后的值
+local currentAccessCount = redis.call("INCR", accessKey)
+
+-- 设置键的过期时间
+redis.call("EXPIRE", accessKey, timeWindow)
+
+-- 返回当前访问次数
+return currentAccessCount
+```
+
+接着设置一个过滤器，来执行lua脚本
+
+```java
+public class UserFlowRiskControlFilter implements Filter {
+
+    private final StringRedisTemplate stringRedisTemplate;
+    private final UserFlowRiskControlConfiguration userFlowRiskControlConfiguration;
+
+    private static final String USER_FLOW_RISK_CONTROL_LUA_SCRIPT_PATH = "lua/user_flow_risk_control.lua";
+
+    @SneakyThrows
+    @Override
+    public void doFilter(ServletRequest request, ServletResponse response, FilterChain filterChain) throws IOException, ServletException {
+        DefaultRedisScript<Long> redisScript = new DefaultRedisScript<>();
+        redisScript.setScriptSource(new ResourceScriptSource(new ClassPathResource(USER_FLOW_RISK_CONTROL_LUA_SCRIPT_PATH)));
+        redisScript.setResultType(Long.class);
+        String username = Optional.ofNullable(UserContext.getUsername()).orElse("other");
+        Long result = null;
+        try {
+            result = stringRedisTemplate.execute(redisScript, Lists.newArrayList(username), userFlowRiskControlConfiguration.getTimeWindow());
+        } catch (Throwable ex) {
+            log.error("执行用户请求流量限制LUA脚本出错", ex);
+            returnJson((HttpServletResponse) response, JSON.toJSONString(Results.failure(new ClientException(FLOW_LIMIT_ERROR))));
+        }
+        if (result == null || result > userFlowRiskControlConfiguration.getMaxAccessCount()) {
+            returnJson((HttpServletResponse) response, JSON.toJSONString(Results.failure(new ClientException(FLOW_LIMIT_ERROR))));
+        }
+        filterChain.doFilter(request, response);
+    }
+
+    private void returnJson(HttpServletResponse response, String json) throws Exception {
+        response.setCharacterEncoding("UTF-8");
+        response.setContentType("text/html; charset=utf-8");
+        try (PrintWriter writer = response.getWriter()) {
+            writer.print(json);
+        }
+    }
+}
+```
+
+接着在userconfig里面配置该过滤器，并设置其与其他过滤器之间的顺序
+
+```java
+    @Bean
+    @ConditionalOnProperty(name = "short-link.flow-limit.enable", havingValue = "true")
+    public FilterRegistrationBean<UserFlowRiskControlFilter> globalUserFlowRiskControlFilter(
+            StringRedisTemplate stringRedisTemplate,
+            UserFlowRiskControlConfiguration userFlowRiskControlConfiguration) {
+        FilterRegistrationBean<UserFlowRiskControlFilter> registration = new FilterRegistrationBean<>();
+        registration.setFilter(new UserFlowRiskControlFilter(stringRedisTemplate, userFlowRiskControlConfiguration));
+        registration.addUrlPatterns("/*");
+        registration.setOrder(10);
+        return registration;
+    }
+```
 
