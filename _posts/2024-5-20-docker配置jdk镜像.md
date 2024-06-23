@@ -1,7 +1,7 @@
 ---
 layout: post
-title: "javaweb学习笔记"
-subtitle: "javaweb Learning"
+title: "服务器docker配置jdk镜像运行项目"
+subtitle: "服务器docker配置jdk镜像运行项目"
 author: "DYC"
 header-img: "img/post-bg-linux.jpg"
 header-mask: 0.3
