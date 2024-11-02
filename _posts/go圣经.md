@@ -1,3 +1,16 @@
+---
+layout: post
+title: "go圣经"
+subtitle: "go圣经"
+author: "DYC"
+header-img: "img/post-bg-linux.jpg"
+header-mask: 0.3
+catalog: true
+tags:
+- go
+
+---
+
 go学习
 
 ### 1.入门
