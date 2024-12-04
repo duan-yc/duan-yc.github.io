@@ -7968,7 +7968,12 @@ class ANode {  // Annotated Node
 
 ```java
 class Solution {
-    public int[][] dirs = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}};
+    public int[][] dirs = {
+      {-1, 0}, 
+      {1, 0}, 
+      {0, -1}, 
+      {0, 1}
+    };
     public int rows, columns;
 
     public int longestIncreasingPath(int[][] matrix) {
@@ -11642,7 +11647,12 @@ class Solution {
     Set<String>set;
     List<String>ans;
     char [][]board;
-    int [][]dirs={{1,0},{-1,0},{0,1},{0,-1}};
+    int [][]dirs={
+      {1,0},
+      {-1,0},
+      {0,1},
+      {0,-1}
+    };
     int n,m;
     boolean[][]visit;
     public List<String> findWords(char[][] _board, String[] words) {
